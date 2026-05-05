@@ -6,9 +6,9 @@ import numpy as np
 class AttentionOnlyModel:
     @staticmethod
     def softmax(x):
-        exp_x = np.exp(x - x.max(axis=-1, keepdims=True)[0])  # avoid overflows via translation invariance
-        return exp_x / (np.sum(exp_x, axis=-1, keepdims=True))
-        #return F.softmax(torch.tensor(x), dim=-1).cpu().numpy()
+        #exp_x = np.exp(x - x.max(axis=-1, keepdims=True)[0])  # avoid overflows via translation invariance
+        #return exp_x / (np.sum(exp_x, axis=-1, keepdims=True))
+        return F.softmax(torch.tensor(x), dim=-1).cpu().numpy()
 
     def __init__(self, cfg, state_dict):
         self.d_vocab = cfg['model']['vocab_size']
@@ -19,16 +19,16 @@ class AttentionOnlyModel:
         self.vocab_info = cfg['vocab']
         self.training_info = cfg['training']
 
-        self.num_range = cfg['training']['num_range']
-        self.list_len = cfg['training']['list_len']
-        self.n_digits = 10
-
         self.d_head = self.d_model // self.n_heads
         self.ignore = -np.inf
 
         self.W_E = state_dict['tok_embed.weight'].cpu().numpy()
-        self.W_P = state_dict['pos_embed.weight'].cpu().numpy()
         self.W_U = state_dict['unembed.weight'].cpu().numpy()
+
+        if 'pos_embed.weight' in state_dict:
+            self.W_P = state_dict['pos_embed.weight'].cpu().numpy()
+        else:
+            self.W_P = np.zeros((self.n_ctx, self.d_model))
 
         self.W_Q = np.empty((self.n_layers, self.n_heads, self.d_model, self.d_head), dtype=np.float32)
         self.W_K = np.empty_like(self.W_Q)
@@ -148,22 +148,19 @@ class AttentionOnlyModel:
             scores = self.softmax(scores)
         return scores
 
-    def verify_raw_model(self, toks, raw_model, atol=1e-3):
+    def verify_raw_model(self, toks, raw_model, n_iter=1, atol=1e-3):
         # Verify models equivalent. Note there is some tolerance due to low-level algorithms and different matrix factorings.
         device = raw_model.tok_embed.weight.device
+        same_logits = True
 
         results = []
-        raw_logits_1, _ = raw_model(torch.tensor(toks, device=device))
-        logits_1 = self.run(toks)
-        same_logits = np.all(np.isclose(raw_logits_1.detach().cpu().numpy(), logits_1, atol=atol))
-        next_tok = np.argmax(logits_1[:,-1], axis=-1)
-        results.append([torch.argmax(raw_logits_1[:,-1], dim=-1), next_tok])
+        for i in range(n_iter):
+            raw_logits, _ = raw_model(torch.tensor(toks, device=device))
+            logits = self.run(toks)
+            same_logits = np.all(np.isclose(raw_logits.detach().cpu().numpy(), logits, atol=atol))
+            next_tok = np.argmax(logits[:,-1], axis=-1)
+            results.append([torch.argmax(raw_logits[:,-1], dim=-1), next_tok])
 
-        if same_logits and self.num_range > 10:
-            toks = np.hstack([toks, next_tok[:,None]])
-            raw_logits_2, _ = raw_model(torch.tensor(toks, device=device))
-            logits_2 = self.run(toks)
-            same_logits = np.all(np.isclose(raw_logits_2.detach().cpu().numpy(), logits_2, atol=atol))
-            results.append([torch.argmax(raw_logits_2[:,-1], dim=-1), np.argmax(logits_2[:,-1], axis=-1)])
+            if not same_logits: break
 
         return results, same_logits

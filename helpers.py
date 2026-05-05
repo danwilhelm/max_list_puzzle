@@ -75,7 +75,7 @@ def tokenize_2(nums: list[int]) -> list[int]:
     return tokens
 
 
-def load_models(device='cpu'):
+def load_models_04_2026(device='cpu'):
     # Download model definition and both sets of weights from HuggingFace
     model_py_path = hf_hub_download("andyrdt/04_2026_puzzle_1a", "model.py")
     spec = importlib.util.spec_from_file_location("model", model_py_path)
@@ -104,14 +104,114 @@ def load_models(device='cpu'):
     raw_model_2.load_state_dict(state_dict_2)
     raw_model_2.eval().to(device)
 
-    model1 = AttentionOnlyModel(config_1, state_dict_1)
-    model2 = AttentionOnlyModel(config_2, state_dict_2)
+    model_1 = AttentionOnlyModel(config_1, state_dict_1)
+    model_2 = AttentionOnlyModel(config_2, state_dict_2)
 
-    return raw_model_1, raw_model_2, model1, model2
+    model_1.num_range = config_1['training']['num_range']
+    model_2.num_range = config_2['training']['num_range']
+    model_1.list_len = config_1['training']['list_len']
+    model_2.list_len = config_2['training']['list_len']
+    model_1.n_digits = 10; model_2.n_digits = 10
+
+    # Useful constants
+    model_1.BOS_POS = 0; model_1.ONES_POS = 1; model_1.SEP_POS = 2
+    model_1.ANS_POS = 10; model_1.LAST_POS = 11
+
+    model_2.BOS_POS = 0; model_2.TENS_POS = 1; model_2.ONES_POS = 2; model_2.SEP_POS = 3
+    model_2.ANS_POS = 15; model_2.TENS_ANS_POS = 16; model_2.LAST_POS = 17
+
+    model_1.seq_labels = [ 'BOS', 'D0', 'SEP', 'D1', 'SEP', 'D2', 'SEP', 'D3', 'SEP', 'D4', 'ANS', 'Dmax', 'EOS' ]
+    model_2.seq_labels = [ 'BOS', 'T0', 'D0', 'SEP', 'T1', 'D1', 'SEP', 'T2', 'D2', 'SEP', 'T3', 'D3', 'SEP',
+                           'T4', 'D4', 'ANS', 'Tmax', 'Dmax', 'EOS' ]
+
+    model_1.embed_labels = [f'E{i}' for i in range(model_1.n_digits)] + ['BOS', 'SEP', 'ANS', 'ANS+1']
+    model_2.embed_labels = model_1.embed_labels.copy()
+
+    model_1.BOS = 10; model_2.BOS = 10
+    model_1.SEP = 11; model_2.SEP = 11
+    model_1.ANS = 12; model_2.ANS = 12
+    model_1.EOS = 13; model_2.EOS = 13
+
+    return raw_model_1, raw_model_2, model_1, model_2
+
+
+def load_models_05_2026(device='cpu'):
+    REPO_ID = "andyrdt/05_2026_puzzle_1"
+    model_py_path = hf_hub_download(REPO_ID, "model.py")
+    spec = importlib.util.spec_from_file_location("model", model_py_path)
+    model_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(model_module)
+    AttentionOnlyTransformer = model_module.AttentionOnlyTransformer
+
+    config_path = hf_hub_download(REPO_ID, "config.json")
+    weights_path = hf_hub_download(REPO_ID, "model.pt")
+
+    config = json.loads(Path(config_path).read_text())
+    state_dict = torch.load(weights_path, map_location=device, weights_only=True)
+
+    raw_model = AttentionOnlyTransformer.from_config(config["model"])
+    raw_model.load_state_dict(state_dict)
+    raw_model.eval().to(device)
+
+    model = AttentionOnlyModel(config, state_dict)
+
+    model.num_symbols = config["vocab"]["num_symbols"]  # 10
+    model.seq_len = config["vocab"]["seq_len"]  # 10
+
+    return raw_model, model
 
 
 ##################################################
-# Analysis/Graphics used in the notebook
+# Analysis functions
+##################################################
+
+def attn_logit_means(model, y_true, tens_digit=False):
+    """For all examples of a given y, compute mean/std of each class logit."""
+    pos = -2 if tens_digit else -1
+    means = np.empty((model.n_layers, model.n_digits,model.n_digits, model.n_heads))
+    stds = np.empty_like(means)
+    for layer in range(model.n_layers):
+        for y in range(model.n_digits):
+            example_ixs = where(y_true // 10 == y) if tens_digit else where(y_true % 10 == y)
+            if len(example_ixs) > 0:
+                for out_cls in range(model.n_digits):
+                    means[layer,y,out_cls] = model.attn_logits[layer,example_ixs, :,pos, out_cls].mean(axis=0)
+                    stds[layer,y,out_cls] = model.attn_logits[layer,example_ixs, :,pos, out_cls].std(axis=0)
+            else:
+                means[layer,y,:] = 0.
+                stds[layer,y,:] = 0.
+    return means, stds
+
+
+def mean_attn_in(model, layer, capture_pos, digit_ix_fn):
+    """Compute the mean attn_in at `capture_pos` given per-digit indices returned by `digit_ix_fn`."""
+    mean_attn_in = np.empty((model.n_digits, model.d_model))
+    for digit in range(0, model.n_digits):
+        example_ixs = digit_ix_fn(digit)          # for the indexes premised on a digit ...
+        if len(example_ixs) > 0:
+            mean_attn_in[digit] = model.attn_in[layer,example_ixs,capture_pos].mean(axis=0)    # ... average across the capture position!
+        else:
+            mean_attn_in[digit] = 0.0
+
+    return mean_attn_in
+
+
+def unembed_accuracy(model, X, y_true, n_samples=1000):
+    y_pred = np.argmax(X[n_samples:n_samples*2] @ model.W_U.T, axis=-1)
+    return np.mean(y_pred == y_true[n_samples:n_samples*2])
+
+
+def logistic_accuracy(X, y, n_samples=1000, max_iter=10000):
+    """Assumes X and y contain double `n_samples` (for validation set) """
+    lr = LogisticRegression(max_iter=max_iter, solver='newton-cg')  # using newton since no max_iter satisfies lbfgs
+    lr.fit(X[:n_samples], y[:n_samples])            # train on training set
+    accuracy = lr.score(X[n_samples:n_samples*2],
+                        y[n_samples:n_samples*2])   # test on validation set
+    return lr, accuracy
+
+
+##################################################
+# Plotting functions
 ##################################################
 
 def imshow(matrix, center=False, facet_col=None, sharey=False,
@@ -141,25 +241,8 @@ def imshow(matrix, center=False, facet_col=None, sharey=False,
     return fig,axs
 
 
-def attn_logit_means(model, y_true, tens_digit=False):
-    """For all examples of a given y, compute mean/std of each class logit."""
-    pos = -2 if tens_digit else -1
-    means = np.empty((model.n_layers, model.n_digits,model.n_digits, model.n_heads))
-    stds = np.empty_like(means)
-    for layer in range(model.n_layers):
-        for y in range(model.n_digits):
-            example_ixs = where(y_true // 10 == y) if tens_digit else where(y_true % 10 == y)
-            if len(example_ixs) > 0:
-                for out_cls in range(model.n_digits):
-                    means[layer,y,out_cls] = model.attn_logits[layer,example_ixs, :,pos, out_cls].mean(axis=0)
-                    stds[layer,y,out_cls] = model.attn_logits[layer,example_ixs, :,pos, out_cls].std(axis=0)
-            else:
-                means[layer,y,:] = 0.
-                stds[layer,y,:] = 0.
-    return means, stds
-
-
-def show_attn_gradient(model, layer, title='', sub_pos=None, row=None, cols=None):
+def show_attn_gradient(model, layer, title='', row=None, cols=None,
+                       sub_pos=None, xlabel='embed/positional token', ylabel='head'):
     sub_pos = sub_pos or model.ANS
     special_pos = [model.BOS_POS, model.SEP_POS, model.ANS_POS, model.LAST_POS]
 
@@ -168,14 +251,13 @@ def show_attn_gradient(model, layer, title='', sub_pos=None, row=None, cols=None
     all_labels = model.embed_labels[:len(cols)] + model.seq_labels
 
     # Same as (XQ) @ (XK).T / sqrt(d_head)
-    scores = np.array([[np.sum(np.tensordot(row, col, axes=0) * model.W_QK[layer,head]) / np.sqrt(model.d_head) \
-                        for col in cols] for head in range(model.n_heads)])
+    scores = np.vstack([model.quick_attn(layer, head, rows=row[None], cols=cols, softmax=False) for head in range(model.n_heads)])
     scores -= scores[:,sub_pos][:,None]  # subtract a per-row constant (softmax is translation-invariant)
 
-    fig, axs = imshow(scores, center=True, xlabel='embed/positional token', ylabel='head', figsize=(16,6),
+    fig, axs = imshow(scores, center=True, xlabel=xlabel, ylabel=ylabel, figsize=(16,6),
                       xticks=all_labels[:len(cols)], yticks=np.arange(model.n_heads), colorbar=True, colorbar_scale=0.5,
                       title=title)
-    axs.axvline(len(model.embed_labels[:-1])-0.5, c='k')
+    axs.axvline(len(model.embed_labels)-0.5, c='k')
 
 
 def show_logit_contribs(model, means, stds, layer=0, title='', xaxis_ytrue=False):
@@ -201,20 +283,6 @@ def show_logit_contribs(model, means, stds, layer=0, title='', xaxis_ytrue=False
     )
     fig.show()
     return fig
-
-
-def unembed_accuracy(model, X, y_true, n_samples=1000):
-    y_pred = np.argmax(X[n_samples:n_samples*2] @ model.W_U.T, axis=-1)
-    return np.mean(y_pred == y_true[n_samples:n_samples*2])
-
-
-def logistic_accuracy(X, y, n_samples=1000, max_iter=10000):
-    """Assumes X and y contain double `n_samples` (for validation set) """
-    lr = LogisticRegression(max_iter=max_iter, solver='newton-cg')  # using newton since no max_iter satisfies lbfgs
-    lr.fit(X[:n_samples], y[:n_samples])            # train on training set
-    accuracy = lr.score(X[n_samples:n_samples*2],
-                        y[n_samples:n_samples*2])   # test on validation set
-    return lr, accuracy
 
 
 def logistic_head_grid(model, y_true, use_unembed=False,
